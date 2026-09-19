@@ -109,6 +109,18 @@
     return best;
   }
 
+  // Beatrix側のtype値。wipeの値が違う場合はここだけ直す。
+  const TYPE_TAP = 1;
+  const TYPE_SLIDE = 2;
+  const TYPE_WIPE = 4;      // Malodyのwipe(type 4)をそのまま使う
+  // スライド始点のtap/wipeは、スライド本体と「同じLPB・同じnum」だと
+  // 消える／つながらないので、分母を5倍にした別表記で出力する。
+  const HEAD_LPB_MULT = 5;
+
+  function timeKey(r, block) {
+    return `${r.n}/${r.d}|${block}`;
+  }
+
   function convertMcToBeatrix(mc) {
     if (!mc || typeof mc !== 'object') throw new Error('データがJSONオブジェクトではありません');
     if (!mc.meta || typeof mc.meta !== 'object') throw new Error('Malody形式ではありません');
@@ -127,59 +139,102 @@
     const version = typeof mc.meta.version === 'string' && mc.meta.version ? mc.meta.version : '';
     const name = version ? `${title}(${version})` : title;
 
-    const outNotes = [];
-
+    // ---- 1周目：全ノーツを解析 ----
+    const items = [];
     for (const note of mc.note) {
       if (!note || typeof note !== 'object') throw new Error('noteに不正なデータがあります');
       // soundノーツはBeatrix譜面ノーツではないため除外。
       if (typeof note.sound === 'string') continue;
 
       const start = beatToRational(note.beat, false);
-      const { LPB, num } = rationalToLPB(start);
-      const block = nearestLaneBlock(Number(note.x));
-      const originalType = Number.isInteger(Number(note.type)) ? Number(note.type) : 1;
+      const x = Number(note.x);
+      const block = nearestLaneBlock(x);
+      const rawType = Number(note.type);
+      const type = (note.type === undefined || rawType === 0 || !Number.isInteger(rawType)) ? TYPE_TAP : rawType;
       const segments = Array.isArray(note.seg) ? note.seg : [];
 
-      if (segments.length > 0) {
-        // seg付き：親(type 2) + 元ノーツ(type) + 子(type 2)
-        const children = [];
-        for (const seg of segments) {
-          if (!seg || typeof seg !== 'object') throw new Error('segに不正なデータがあります');
-          const segBeat = beatToRational(seg.beat, true);
-          const absolute = addRational(start, segBeat);
-          const childTime = rationalToLPB(absolute);
-          const childX = Number(note.x) + Number(seg.x || 0);
-          const childBlock = nearestLaneBlock(childX);
-          children.push({
-            LPB: childTime.LPB,
-            num: childTime.num,
-            block: childBlock,
-            type: 2,
-            notes: []
-          });
-        }
+      const vertices = []; // seg頂点（絶対時刻・レーン）
+      for (const seg of segments) {
+        if (!seg || typeof seg !== 'object') throw new Error('segに不正なデータがあります');
+        const absolute = addRational(start, beatToRational(seg.beat, true));
+        vertices.push({ time: absolute, block: nearestLaneBlock(x + Number(seg.x || 0)) });
+      }
+      items.push({ start, block, type, vertices, isSlide: vertices.length > 0 });
+    }
 
-        outNotes.push({ LPB, num, block, type: 2, notes: children });
-        outNotes.push({ LPB, num, block, type: originalType, notes: [] });
-      } else {
-        outNotes.push({ LPB, num, block, type: originalType, notes: [] });
+    // ---- スライド始点／頂点のインデックス ----
+    const slideStartKeys = new Set();
+    const slideVertexKeys = new Set();
+    for (const it of items) {
+      if (!it.isSlide) continue;
+      slideStartKeys.add(timeKey(it.start, it.block));
+      for (const v of it.vertices) slideVertexKeys.add(timeKey(v.time, v.block));
+    }
+
+    // スライド始点と同時刻・同レーンにあるtap/wipeは「始点」として吸収する。
+    // wipeがあれば始点はwipe、なければtap。
+    const headTypes = new Map();
+    const consumed = new Set();
+    let droppedWipes = 0;
+    for (const it of items) {
+      if (it.isSlide) continue;
+      const k = timeKey(it.start, it.block);
+      if (slideStartKeys.has(k)) {
+        consumed.add(it);
+        const prev = headTypes.get(k);
+        if (it.type === TYPE_WIPE || prev === undefined) headTypes.set(k, it.type);
+      } else if (it.type === TYPE_WIPE && slideVertexKeys.has(k)) {
+        // スライド途中／終端と重なるwipeはスライド側に統合（出力しない）
+        consumed.add(it);
+        droppedWipes++;
       }
     }
 
-    const result = {
+    // ---- 2周目：出力 ----
+    const outNotes = [];
+    let headTap = 0, headWipe = 0;
+    for (const it of items) {
+      if (consumed.has(it)) continue;
+      const { LPB, num } = rationalToLPB(it.start);
+
+      if (!it.isSlide) {
+        outNotes.push({ LPB, num, block: it.block, type: it.type, notes: [] });
+        continue;
+      }
+
+      // スライド本体（type 2）＋子ノード
+      const children = it.vertices.map(v => {
+        const t = rationalToLPB(v.time);
+        return { LPB: t.LPB, num: t.num, block: v.block, type: TYPE_SLIDE, notes: [] };
+      });
+      outNotes.push({ LPB, num, block: it.block, type: TYPE_SLIDE, notes: children });
+
+      // 始点ノーツ（別LPB表記）
+      const headType = headTypes.has(timeKey(it.start, it.block))
+        ? headTypes.get(timeKey(it.start, it.block)) : TYPE_TAP;
+      if (headType === TYPE_WIPE) headWipe++; else headTap++;
+      outNotes.push({
+        LPB: LPB * HEAD_LPB_MULT,
+        num: num * HEAD_LPB_MULT,
+        block: it.block,
+        type: headType,
+        notes: []
+      });
+    }
+
+    return {
       name,
       maxBlock: 7,
       BPM: firstBpm,
       LEVEL: 1.0,
       offset: 0,
-      notes: outNotes
+      notes: outNotes,
+      __stats: { headTap, headWipe, droppedWipes }
     };
-
-    return result;
   }
 
   function makeDownloadName(inputName, json) {
-    let base = inputName.replace(/\\.[^.\\/]+$/, '');
+    let base = inputName.replace(/\.[^./\\]+$/, '');
     if (/^Malody_/i.test(base)) base = base.slice(7);
     if (!base) base = json.name || 'chart';
     return base + '.json';
@@ -215,10 +270,12 @@
         if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
         const mc = JSON.parse(text);
         const json = convertMcToBeatrix(mc);
+        const stats = json.__stats;
+        delete json.__stats;
         const blob = new Blob([JSON.stringify(json)], { type: 'application/json;charset=utf-8' });
         downloadUrl = URL.createObjectURL(blob);
         downloadName = makeDownloadName(file.name, json);
-        status.textContent = `変換完了：${downloadName}`;
+        status.textContent = `変換完了：${downloadName}\n始点tap ${stats.headTap} / 始点wipe ${stats.headWipe} / スライドに統合したwipe ${stats.droppedWipes}`;
         downloadButton.style.display = 'inline-block';
       } catch (error) {
         console.error(error);
