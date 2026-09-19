@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Beatrix 譜面ずらし</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; background: #000; color: #fff; }
+  body { font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; padding: 24px; }
+  main { width: min(680px,100%); margin: 0 auto; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 20px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
+  button, .file-button {
+    appearance: none; border: 1px solid #fff; background: #000; color: #fff;
+    border-radius: 8px; padding: 11px 15px; font: inherit; cursor: pointer;
+  }
+  button:disabled { opacity: .45; cursor: default; }
+  .file-button { display: inline-block; }
+  input[type=file] { display: none; }
+  input[type=number] {
+    width: 80px; background: #000; color: #fff; border: 1px solid #fff;
+    border-radius: 8px; padding: 10px 12px; font: inherit;
+  }
+  #status { margin-top: 6px; min-height: 1.5em; white-space: pre-wrap; word-break: break-word; }
+  .sub { margin-top: 8px; color: #aaa; font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Beatrix 譜面ずらし</h1>
+
+  <div class="row">
+    <label class="file-button" for="jsonFile">jsonを選択</label>
+    <input id="jsonFile" type="file">
+    <span id="fileName" class="sub" style="margin:0">未選択</span>
+  </div>
+
+  <div class="row">
+    <span>ずらす長さ：1拍を</span>
+    <input id="division" type="number" step="1" min="1" value="4">
+    <span>分割した</span>
+    <input id="count" type="number" step="1" value="4">
+    <span>個分</span>
+  </div>
+  <div class="sub" style="margin:-6px 0 14px">4分割＝16分音符。上の例は16分音符4つ分（1拍）後ろへずらします。マイナスで前へ。</div>
+
+  <div class="row">
+    <button id="download" type="button" disabled>ずらしてダウンロード</button>
+  </div>
+  <div id="status">jsonを選択してください</div>
+  <div class="sub">選択したファイルはブラウザ内だけで処理します。</div>
+</main>
+<script>
+(() => {
+  'use strict';
+
+  const fileInput = document.getElementById('jsonFile');
+  const fileNameEl = document.getElementById('fileName');
+  const divisionEl = document.getElementById('division');
+  const countEl = document.getElementById('count');
+  const downloadButton = document.getElementById('download');
+  const status = document.getElementById('status');
+
+  let chart = null;
+  let sourceName = '';
+
+  function gcd(a, b) {
+    a = Math.abs(a); b = Math.abs(b);
+    while (b) { const r = a % b; a = b; b = r; }
+    return a || 1;
+  }
+
+  // 全ノーツ（子ノード含む）を count/division 拍ぶんずらす。
+  // 各ノーツのLPBは、割り切れる限りそのまま維持する
+  // （始点tapとスライドのLPB違いを壊さないため）。
+  function shiftNotes(notes, count, division, stats) {
+    for (const n of notes) {
+      if (!n || typeof n !== 'object') throw new Error('notesに不正なデータがあります');
+      const lpb = Number(n.LPB);
+      const num = Number(n.num);
+      if (!Number.isInteger(lpb) || lpb <= 0 || !Number.isInteger(num)) {
+        throw new Error('LPBまたはnumが不正なノーツがあります');
+      }
+      if ((count * lpb) % division === 0) {
+        n.num = num + (count * lpb) / division;
+      } else {
+        const lcm = lpb / gcd(lpb, division) * division;
+        n.num = num * (lcm / lpb) + count * (lcm / division);
+        n.LPB = lcm;
+        stats.changedLPB++;
+      }
+      stats.total++;
+      if (n.num < 0) stats.negative++;
+      if (Array.isArray(n.notes)) shiftNotes(n.notes, count, division, stats);
+    }
+  }
+
+  function makeDownloadName(inputName) {
+    let base = inputName.replace(/\.[^./\\]+$/, '');
+    if (!base) base = 'chart';
+    return base + '_shifted.json';
+  }
+
+  function setLoaded(ok) { downloadButton.disabled = !ok; }
+
+  fileInput.addEventListener('change', () => {
+    chart = null;
+    setLoaded(false);
+    const file = fileInput.files && fileInput.files[0];
+    if (!file) {
+      fileNameEl.textContent = '未選択';
+      status.textContent = 'jsonを選択してください';
+      return;
+    }
+    fileNameEl.textContent = file.name;
+    sourceName = file.name;
+    status.textContent = '読み込み中...';
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        let text = String(reader.result || '');
+        if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+        const data = JSON.parse(text);
+        if (!data || typeof data !== 'object' || !Array.isArray(data.notes)) {
+          throw new Error('notes配列がありません');
+        }
+        chart = data;
+        setLoaded(true);
+        status.textContent = '読み込み完了。長さを入力してダウンロードしてください';
+      } catch (error) {
+        console.error(error);
+        status.textContent = `非対応のデータ形式です\n（${error.message}）`;
+      }
+    };
+    reader.onerror = () => { status.textContent = 'ファイルを読み込めませんでした'; };
+    reader.readAsText(file, 'utf-8');
+  });
+
+  downloadButton.addEventListener('click', () => {
+    if (!chart) return;
+    const division = Number(divisionEl.value);
+    const count = Number(countEl.value);
+    if (!Number.isInteger(division) || division <= 0) {
+      status.textContent = '分割数は1以上の整数にしてください';
+      return;
+    }
+    if (!Number.isInteger(count)) {
+      status.textContent = '個数は整数にしてください';
+      return;
+    }
+    try {
+      // 元データを壊さないよう複製してから処理
+      const copy = JSON.parse(JSON.stringify(chart));
+      const stats = { total: 0, negative: 0, changedLPB: 0 };
+      shiftNotes(copy.notes, count, division, stats);
+
+      const blob = new Blob([JSON.stringify(copy)], { type: 'application/json;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = makeDownloadName(sourceName);
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+      let msg = `ずらしました：${a.download}\n${stats.total}ノーツを ${count}/${division} 拍ずらしました`;
+      if (stats.negative > 0) msg += `\n注意：numが負のノーツが ${stats.negative} 個残っています`;
+      status.textContent = msg;
+    } catch (error) {
+      console.error(error);
+      status.textContent = `ずらせませんでした\n（${error.message}）`;
+    }
+  });
+
+  // テスト用にグローバルへ露出（通常利用では何もしない）。
+  window.__zurasu = { shiftNotes };
+})();
+</script>
+</body>
+</html>
